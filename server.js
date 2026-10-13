@@ -115,16 +115,10 @@ app.post('/api/tasks',auth,upload.single('file'),asyncRoute(async(req,res)=>{
   const {rows:uRows}=await client.query('SELECT balance FROM users WHERE id=$1 FOR UPDATE',[req.user.id]);
   if(!uRows[0] || Number(uRows[0].balance)<cost) {await client.query('ROLLBACK');return res.status(402).json({error:'Insufficient balance',estimatedCost:cost});}
   const id=crypto.randomUUID();
-  const resultRows=records.map((value,i)=>({record:value,result:'DEMO — NOT VERIFIED',note:'No live provider connected'}));
-  const resultData='record,result,note\n'+resultRows.map(x=>[x.record,x.result,x.note].map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
-  await client.query('INSERT INTO tasks(id,user_id,product_id,name,region,input_filename,input_data,input_count,status,mode,cost,result_filename,result_data,result_count,completed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())',[id,req.user.id,productId,name,region,req.file?cleanName(req.file.originalname):null,records.join('\n'),records.length,'complete','demo',cost,'results-'+id+'.csv',resultData,records.length]);
-  if(cost>0) {
-   await client.query('UPDATE users SET balance=balance-$1 WHERE id=$2',[cost,req.user.id]);
-   await client.query("INSERT INTO ledger(user_id,task_id,amount,entry_type,note) VALUES($1,$2,$3,'debit',$4)",[req.user.id,id,cost,'Demo task estimate; no external verification was performed']);
-  }
-  await audit(client,req.user.id,'task_created','task',id,{productId,records:records.length,mode:'demo',cost});
+  await client.query('INSERT INTO tasks(id,user_id,product_id,name,region,input_filename,input_data,input_count,status,mode,cost) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',[id,req.user.id,productId,name,region,req.file?cleanName(req.file.originalname):null,records.join('\n'),records.length,'queued','demo',0]);
+  await audit(client,req.user.id,'task_created','task',id,{productId,records:records.length,mode:'manual_review'});
   await client.query('COMMIT');
-  res.status(201).json({task:{id,name,productId,region,records:records.length,cost,status:'complete',mode:'demo',message:'Demo output only. No real iOS/account status was checked.'}});
+  res.status(201).json({task:{id,name,productId,region,records:records.length,cost:0,status:'queued',mode:'manual_review',message:'Pending manual verification. No charge has been applied yet.'}});
  } catch(e) {try{await client.query('ROLLBACK')}catch{} throw e} finally {client.release()}
 }));
 app.get('/api/tasks',auth,asyncRoute(async(req,res)=>{
@@ -179,7 +173,27 @@ app.post('/api/admin/tasks/:id/results',auth,admin,upload.single('file'),asyncRo
  if(!req.file)return res.status(400).json({error:'Upload a TXT or CSV result file'});
  const data=req.file.buffer.toString('utf8');if(data.includes('\0'))return res.status(400).json({error:'Invalid text file'});
  const client=await pool.connect();
- try{await client.query('BEGIN');const {rows}=await client.query('UPDATE tasks SET result_filename=$1,result_data=$2,result_count=$3,mode=$4,status=$5,completed_at=NOW() WHERE id=$6 RETURNING id,user_id,name,result_filename,result_count,status',[cleanName(req.file.originalname),data,parseRows(data).length,'demo','complete',req.params.id]);if(!rows[0]){await client.query('ROLLBACK');return res.status(404).json({error:'Task not found'})}await audit(client,req.user.id,'result_file_uploaded','task',req.params.id,{filename:cleanName(req.file.originalname),bytes:req.file.size});await client.query('COMMIT');res.json({task:rows[0],notice:'Result file stored. This does not assert the contents are verified or provider-backed.'})}catch(e){try{await client.query('ROLLBACK')}catch{}throw e}finally{client.release()}
+ try {
+  await client.query('BEGIN');
+  const {rows:taskRows}=await client.query('SELECT id,user_id,input_count,status FROM tasks WHERE id=$1 FOR UPDATE',[req.params.id]);
+  const task=taskRows[0];
+  if(!task){await client.query('ROLLBACK');return res.status(404).json({error:'Task not found'})}
+  if(task.status==='complete'){await client.query('ROLLBACK');return res.status(409).json({error:'This task is already completed. Create a new task for a replacement result.'})}
+  const {rows:userRows}=await client.query('SELECT balance FROM users WHERE id=$1 FOR UPDATE',[task.user_id]);
+  const {rows:productRows}=await client.query('SELECT price_per_10000 FROM products WHERE id=(SELECT product_id FROM tasks WHERE id=$1)',[task.id]);
+  const freeProducts=['txt-validation','csv-validation','number-format','email-format','data-dedup'];
+  const {rows:taskProduct}=await client.query('SELECT product_id FROM tasks WHERE id=$1',[task.id]);
+  const charge=freeProducts.includes(taskProduct[0].product_id)?0:Number(productRows[0].price_per_10000)*Number(task.input_count)/10000;
+  if(Number(userRows[0].balance)<charge){await client.query('ROLLBACK');return res.status(402).json({error:'User has insufficient balance to complete and charge this task',required:charge,balance:Number(userRows[0].balance)})}
+  const {rows}=await client.query('UPDATE tasks SET result_filename=$1,result_data=$2,result_count=$3,mode=$4,status=$5,cost=$6,completed_at=NOW() WHERE id=$7 RETURNING id,user_id,name,result_filename,result_count,status,cost',[cleanName(req.file.originalname),data,parseRows(data).length,'manual_review','complete',charge,req.params.id]);
+  if(charge>0){
+    await client.query('UPDATE users SET balance=balance-$1 WHERE id=$2',[charge,task.user_id]);
+    await client.query("INSERT INTO ledger(user_id,task_id,amount,entry_type,note) VALUES($1,$2,$3,'debit',$4)",[task.user_id,task.id,charge,'Manual verification task completed; rate is 4 USDT per 10,000 records']);
+  }
+  await audit(client,req.user.id,'manual_results_uploaded','task',req.params.id,{filename:cleanName(req.file.originalname),bytes:req.file.size,charge,mode:'manual_review'});
+  await client.query('COMMIT');
+  res.json({task:rows[0],notice:'Result file uploaded by admin. Billing was applied at completion when applicable; the portal does not independently certify file contents.'});
+ } catch(e){try{await client.query('ROLLBACK')}catch{}throw e} finally{client.release()}
 }));
 app.get('/api/admin/tasks/:id/input',auth,admin,asyncRoute(async(req,res)=>{const {rows}=await pool.query('SELECT input_filename,input_data FROM tasks WHERE id=$1',[req.params.id]);if(!rows[0])return res.status(404).json({error:'Task not found'});res.setHeader('Content-Disposition','attachment; filename="'+cleanName(rows[0].input_filename||'input.txt')+'"');res.type('text/plain').send(rows[0].input_data)}));
 app.use(express.static(path.join(__dirname,'public')));
